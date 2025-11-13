@@ -1,0 +1,7 @@
+data/
+test/
+*.xlsx
+*.xls
+*.csv
+*.pth
+*.pt
