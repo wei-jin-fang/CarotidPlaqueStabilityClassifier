@@ -5,7 +5,7 @@
 # ==============================================================================
 
 # 设置使用的 GPU (例如: 0,1 表示使用 GPU 0 和 1)
-# export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=0,1
 
 # 训练参数 - 使用更保守的设置防止 NaN
 DATA_ROOT="/home/jinfang/project/CarotidPlaqueStabilityClassifier/data"

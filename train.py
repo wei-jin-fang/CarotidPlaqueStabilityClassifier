@@ -259,12 +259,14 @@ class ResNetAttentionFusion(nn.Module):
                 fused = feats.squeeze(0)
             else:
                 attn = self.attention(feats).squeeze(-1)      #[N_i, 512]-[N_i,1]- [N_i]
+                # 添加数值稳定性：裁剪 attention 分数防止极端值
+                attn = torch.clamp(attn, min=-10, max=10)
                 # print(f"{attn.shape}")#torch.Size([N_i])
                 weights = torch.softmax(attn, dim=0).unsqueeze(-1)
                 # print(f"{weights.shape}")#torch.Size([N_i],1)
                 fused = torch.sum(feats * weights, dim=0)      #[5, 512]* [5, 1]= [5, 512]--》sum= [512]
                 # print(f"{fused.shape}")#torch.Size(512)
-                
+
             fused_list.append(fused)
 
         fused = torch.stack(fused_list)  # [B, 512]
@@ -366,11 +368,23 @@ def train_model(model, train_loader, val_loader, device, sub_dirs, epochs=20, lr
             logits, _ = model(seq_list)
             loss = criterion(logits, labels)
 
+            # 检查损失是否为 NaN
+            if torch.isnan(loss) or torch.isinf(loss):
+                if accelerator is None or accelerator.is_main_process:
+                    print(f"\n⚠️  警告: 检测到 NaN/Inf 损失，跳过此批次")
+                continue
+
             # 使用 accelerator.backward() 或标准 backward()
             if accelerator:
                 accelerator.backward(loss)
             else:
                 loss.backward()
+
+            # 梯度裁剪，防止梯度爆炸
+            if accelerator:
+                accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
             optimizer.step()
 
