@@ -3,7 +3,8 @@
 完整训练 + 融合 + Grad-CAM
 解决：不同人图片数量不一致 → DataLoader stack 错误
 """
-
+# 文件开头统一写
+from tqdm import tqdm
 import os
 import random
 import torch
@@ -28,9 +29,10 @@ from datetime import datetime
 import json
 import shutil
 import argparse
+
 warnings.filterwarnings("ignore")
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
 
 # ====================== 0. 创建训练文件夹 ======================
 def create_training_folder(base_dir="."):
@@ -332,34 +334,43 @@ def train_model(model, train_loader, val_loader, device, sub_dirs, epochs=20, lr
     print("开始训练...")
     print("="*60)
 
+    from tqdm import tqdm
+
     for epoch in range(epochs):
-        # ==================== 训练阶段 ====================
+        # ---------------- 训练 ----------------
         model.train()
         total_loss = 0.0
-        for seq_list, labels in train_loader:
+        avg_train_loss = 0.0   # 默认值
+
+        pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs}')
+        for seq_list, labels in pbar:
             seq_list = [img.to(device) for img in seq_list]
             labels = labels.to(device)
+
             optimizer.zero_grad()
             logits, _ = model(seq_list)
             loss = criterion(logits, labels)
             loss.backward()
             optimizer.step()
+
             total_loss += loss.item()
+            pbar.set_postfix({'loss': f'{loss.item():.4f}',
+                            'avg_loss': f'{total_loss/(pbar.n+1):.4f}'})
 
-        avg_train_loss = total_loss / len(train_loader)
+        # 整个 epoch 的平均训练损失
+        avg_train_loss = total_loss / len(train_loader) if len(train_loader) else 0.0
 
-        # ==================== 验证阶段 ====================
+        # ---------------- 验证 ----------------
         model.eval()
-        correct, total = 0, 0
+        correct = total = 0
         val_loss = 0.0
         with torch.no_grad():
             for seq_list, labels in val_loader:
-                # 跳过 batch_size=1 的情况 (BatchNorm 会报错)
-                if labels.size(0) == 1:
+                if labels.size(0) == 1:        # 跳过 batch_size=1
                     continue
-
                 seq_list = [img.to(device) for img in seq_list]
                 labels = labels.to(device)
+
                 logits, _ = model(seq_list)
                 loss = criterion(logits, labels)
                 val_loss += loss.item()
@@ -367,34 +378,27 @@ def train_model(model, train_loader, val_loader, device, sub_dirs, epochs=20, lr
                 correct += (pred == labels).sum().item()
                 total += labels.size(0)
 
-        # 避免除零错误
-        if len(val_loader) == 0 or total == 0:
-            avg_val_loss = 0.0
-            val_acc = 0.0
-        else:
-            avg_val_loss = val_loss / max(1, len(val_loader))
-            val_acc = correct / max(1, total)
+        avg_val_loss = val_loss / max(1, len(val_loader)) if total else 0.0
+        val_acc = correct / max(1, total) if total else 0.0
         current_lr = optimizer.param_groups[0]['lr']
-        
-        # 记录历史
+
+        # ---------------- 记录 & 打印 ----------------
         history['train_loss'].append(avg_train_loss)
         history['val_acc'].append(val_acc)
         history['val_loss'].append(avg_val_loss)
         history['learning_rate'].append(current_lr)
 
-        # 打印进度
         print(f"Epoch {epoch+1:2d}/{epochs} | "
-              f"Train Loss: {avg_train_loss:.4f} | "
-              f"Val Loss: {avg_val_loss:.4f} | "
-              f"Val Acc: {val_acc:.4f} | "
-              f"LR: {current_lr:.6f}")
+            f"Train Loss: {avg_train_loss:.4f} | "
+            f"Val Loss: {avg_val_loss:.4f} | "
+            f"Val Acc: {val_acc:.4f} | "
+            f"LR: {current_lr:.6f}")
 
-        # 保存最佳模型
+        # ---------------- 保存最佳模型 & 调度器 ----------------
         if val_acc > best_acc:
             best_acc = val_acc
             best_epoch = epoch + 1
-            best_model_path = os.path.join(sub_dirs['models'], "best_model.pth")
-            torch.save(model.state_dict(), best_model_path)
+            torch.save(model.state_dict(), os.path.join(sub_dirs['models'], "best_model.pth"))
             print(f"  → 保存最佳模型 (Val Acc: {best_acc:.4f})")
 
         scheduler.step()
@@ -833,9 +837,9 @@ def parse_args():
 
     # 数据配置
     data_group = parser.add_argument_group('数据配置')
-    data_group.add_argument('--root-dir', type=str, default='./data',
+    data_group.add_argument('--root-dir', type=str, default='/seu_nvme/home/shendian/220256451/datasets/Carotid_artery/Carotid_artery',
                            help='数据根目录')
-    data_group.add_argument('--label-excel', type=str, default='./label.xlsx',
+    data_group.add_argument('--label-excel', type=str, default='/seu_nvme/home/shendian/220256451/datasets/Carotid_artery/label.xlsx',
                            help='标签 Excel 文件路径')
     data_group.add_argument('--class-names', type=str, nargs=2, default=['0', '1'],
                            help='类别名称 (两个类别)')
@@ -866,7 +870,7 @@ def parse_args():
     other_group = parser.add_argument_group('其他配置')
     other_group.add_argument('--seed', '--random-seed', type=int, default=42,
                             dest='random_seed', help='随机种子')
-    other_group.add_argument('--device', type=str, default='auto',
+    other_group.add_argument('--device', type=str, default='cuda',
                             choices=['auto', 'cuda', 'cpu'],
                             help='计算设备')
     other_group.add_argument('--num-workers', type=int, default=0,
