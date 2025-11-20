@@ -29,6 +29,7 @@ from datetime import datetime
 import json
 import shutil
 import argparse
+from accelerate import Accelerator
 
 warnings.filterwarnings("ignore")
 import os
@@ -302,7 +303,7 @@ class ResNetAttentionFusion(nn.Module):
 
 
 # ====================== 4. 训练函数 ======================
-def train_model(model, train_loader, val_loader, device, sub_dirs, epochs=20, lr=1e-4):
+def train_model(model, train_loader, val_loader, device, sub_dirs, epochs=20, lr=1e-4, accelerator=None):
     """
     训练模型并保存训练历史
 
@@ -314,6 +315,7 @@ def train_model(model, train_loader, val_loader, device, sub_dirs, epochs=20, lr
         sub_dirs: 训练目录字典
         epochs: 训练轮数
         lr: 学习率
+        accelerator: Accelerator 对象用于分布式训练
     """
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
@@ -330,9 +332,15 @@ def train_model(model, train_loader, val_loader, device, sub_dirs, epochs=20, lr
     best_acc = 0.0
     best_epoch = 0
 
-    print("\n" + "="*60)
-    print("开始训练...")
-    print("="*60)
+    # 使用 accelerator.print() 确保只在主进程打印
+    if accelerator:
+        accelerator.print("\n" + "="*60)
+        accelerator.print("开始训练...")
+        accelerator.print("="*60)
+    else:
+        print("\n" + "="*60)
+        print("开始训练...")
+        print("="*60)
 
     from tqdm import tqdm
 
@@ -342,20 +350,37 @@ def train_model(model, train_loader, val_loader, device, sub_dirs, epochs=20, lr
         total_loss = 0.0
         avg_train_loss = 0.0   # 默认值
 
-        pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs}')
+        # 只在主进程显示进度条
+        if accelerator is None or accelerator.is_main_process:
+            pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs}')
+        else:
+            pbar = train_loader
+
         for seq_list, labels in pbar:
-            seq_list = [img.to(device) for img in seq_list]
-            labels = labels.to(device)
+            # accelerate 会自动处理设备转移
+            if accelerator is None:
+                seq_list = [img.to(device) for img in seq_list]
+                labels = labels.to(device)
 
             optimizer.zero_grad()
             logits, _ = model(seq_list)
             loss = criterion(logits, labels)
-            loss.backward()
+
+            # 使用 accelerator.backward() 或标准 backward()
+            if accelerator:
+                accelerator.backward(loss)
+            else:
+                loss.backward()
+
             optimizer.step()
 
             total_loss += loss.item()
-            pbar.set_postfix({'loss': f'{loss.item():.4f}',
-                            'avg_loss': f'{total_loss/(pbar.n+1):.4f}'})
+
+            # 只在主进程更新进度条
+            if accelerator is None or accelerator.is_main_process:
+                if hasattr(pbar, 'set_postfix'):
+                    pbar.set_postfix({'loss': f'{loss.item():.4f}',
+                                    'avg_loss': f'{total_loss/(pbar.n+1):.4f}'})
 
         # 整个 epoch 的平均训练损失
         avg_train_loss = total_loss / len(train_loader) if len(train_loader) else 0.0
@@ -368,8 +393,10 @@ def train_model(model, train_loader, val_loader, device, sub_dirs, epochs=20, lr
             for seq_list, labels in val_loader:
                 if labels.size(0) == 1:        # 跳过 batch_size=1
                     continue
-                seq_list = [img.to(device) for img in seq_list]
-                labels = labels.to(device)
+
+                if accelerator is None:
+                    seq_list = [img.to(device) for img in seq_list]
+                    labels = labels.to(device)
 
                 logits, _ = model(seq_list)
                 loss = criterion(logits, labels)
@@ -377,6 +404,22 @@ def train_model(model, train_loader, val_loader, device, sub_dirs, epochs=20, lr
                 pred = logits.argmax(dim=1)
                 correct += (pred == labels).sum().item()
                 total += labels.size(0)
+
+        # 在多GPU环境下同步指标
+        if accelerator and accelerator.num_processes > 1:
+            # 使用 all_reduce 来同步指标，兼容旧版本 PyTorch
+            correct_tensor = torch.tensor(correct, dtype=torch.float32, device=accelerator.device)
+            total_tensor = torch.tensor(total, dtype=torch.float32, device=accelerator.device)
+            val_loss_tensor = torch.tensor(val_loss, dtype=torch.float32, device=accelerator.device)
+
+            # 在所有进程间求和
+            torch.distributed.all_reduce(correct_tensor, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(total_tensor, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(val_loss_tensor, op=torch.distributed.ReduceOp.SUM)
+
+            correct = int(correct_tensor.item())
+            total = int(total_tensor.item())
+            val_loss = val_loss_tensor.item()
 
         avg_val_loss = val_loss / max(1, len(val_loader)) if total else 0.0
         val_acc = correct / max(1, total) if total else 0.0
@@ -388,45 +431,63 @@ def train_model(model, train_loader, val_loader, device, sub_dirs, epochs=20, lr
         history['val_loss'].append(avg_val_loss)
         history['learning_rate'].append(current_lr)
 
-        print(f"Epoch {epoch+1:2d}/{epochs} | "
-            f"Train Loss: {avg_train_loss:.4f} | "
-            f"Val Loss: {avg_val_loss:.4f} | "
-            f"Val Acc: {val_acc:.4f} | "
-            f"LR: {current_lr:.6f}")
+        # 只在主进程打印
+        if accelerator is None or accelerator.is_main_process:
+            print(f"Epoch {epoch+1:2d}/{epochs} | "
+                f"Train Loss: {avg_train_loss:.4f} | "
+                f"Val Loss: {avg_val_loss:.4f} | "
+                f"Val Acc: {val_acc:.4f} | "
+                f"LR: {current_lr:.6f}")
 
         # ---------------- 保存最佳模型 & 调度器 ----------------
         if val_acc > best_acc:
             best_acc = val_acc
             best_epoch = epoch + 1
-            torch.save(model.state_dict(), os.path.join(sub_dirs['models'], "best_model.pth"))
-            print(f"  → 保存最佳模型 (Val Acc: {best_acc:.4f})")
+
+            # 使用 accelerator.save() 保存模型
+            if accelerator is None or accelerator.is_main_process:
+                if accelerator:
+                    # 保存解包的模型
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    torch.save(unwrapped_model.state_dict(), os.path.join(sub_dirs['models'], "best_model.pth"))
+                else:
+                    torch.save(model.state_dict(), os.path.join(sub_dirs['models'], "best_model.pth"))
+                print(f"  → 保存最佳模型 (Val Acc: {best_acc:.4f})")
 
         scheduler.step()
 
-    print("="*60)
-    print(f"训练完成! 最佳验证准确率: {best_acc:.4f} (Epoch {best_epoch})")
-    print("="*60 + "\n")
+    # 只在主进程打印
+    if accelerator is None or accelerator.is_main_process:
+        print("="*60)
+        print(f"训练完成! 最佳验证准确率: {best_acc:.4f} (Epoch {best_epoch})")
+        print("="*60 + "\n")
 
     # ==================== 保存训练历史 ====================
-    # 1. 保存为 CSV
-    history_df = pd.DataFrame(history)
-    history_df['epoch'] = range(1, epochs + 1)
-    history_csv_path = os.path.join(sub_dirs['logs'], 'training_history.csv')
-    history_df.to_csv(history_csv_path, index=False)
-    print(f"✓ 训练历史已保存: {history_csv_path}")
+    # 只在主进程保存
+    if accelerator is None or accelerator.is_main_process:
+        # 1. 保存为 CSV
+        history_df = pd.DataFrame(history)
+        history_df['epoch'] = range(1, epochs + 1)
+        history_csv_path = os.path.join(sub_dirs['logs'], 'training_history.csv')
+        history_df.to_csv(history_csv_path, index=False)
+        print(f"✓ 训练历史已保存: {history_csv_path}")
 
-    # 2. 保存为 JSON
-    history_json_path = os.path.join(sub_dirs['logs'], 'training_history.json')
-    with open(history_json_path, 'w') as f:
-        json.dump(history, f, indent=4)
+        # 2. 保存为 JSON
+        history_json_path = os.path.join(sub_dirs['logs'], 'training_history.json')
+        with open(history_json_path, 'w') as f:
+            json.dump(history, f, indent=4)
 
-    # 3. 绘制训练曲线
-    plot_training_curves(history, epochs, sub_dirs['plots'])
+        # 3. 绘制训练曲线
+        plot_training_curves(history, epochs, sub_dirs['plots'])
 
-    # 4. 保存最终模型
-    final_model_path = os.path.join(sub_dirs['models'], "final_model.pth")
-    torch.save(model.state_dict(), final_model_path)
-    print(f"✓ 最终模型已保存: {final_model_path}")
+        # 4. 保存最终模型
+        final_model_path = os.path.join(sub_dirs['models'], "final_model.pth")
+        if accelerator:
+            unwrapped_model = accelerator.unwrap_model(model)
+            torch.save(unwrapped_model.state_dict(), final_model_path)
+        else:
+            torch.save(model.state_dict(), final_model_path)
+        print(f"✓ 最终模型已保存: {final_model_path}")
 
     return history, best_acc
 
@@ -907,27 +968,63 @@ def parse_args():
 
 # ====================== 8. 主程序 ======================
 if __name__ == "__main__":
+    # ==================== 初始化 Accelerator ====================
+    accelerator = Accelerator()
+
     # ==================== 解析命令行参数 ====================
     args = parse_args()
 
     # 转换为字典方便保存和打印
     config_dict = vars(args)
 
-    DEVICE = torch.device(args.device)
+    # 使用 accelerator.device 替代手动设备管理
+    DEVICE = accelerator.device
 
-    print("\n" + "="*60)
-    print("训练配置")
-    print("="*60)
+    # 只在主进程打印
+    accelerator.print("\n" + "="*60)
+    accelerator.print("训练配置")
+    accelerator.print("="*60)
+    accelerator.print(f"  当前进程: {accelerator.process_index + 1}/{accelerator.num_processes}")
+    accelerator.print(f"  使用设备: {accelerator.device}")
+    accelerator.print(f"  混合精度: {accelerator.mixed_precision}")
     for key, value in config_dict.items():
-        print(f"  {key}: {value}")
-    print("="*60 + "\n")
+        accelerator.print(f"  {key}: {value}")
+    accelerator.print("="*60 + "\n")
 
     # ==================== 创建训练文件夹 ====================
-    exp_dir, sub_dirs = create_training_folder(base_dir=args.output_dir)
+    # 只在主进程创建文件夹
+    if accelerator.is_main_process:
+        exp_dir, sub_dirs = create_training_folder(base_dir=args.output_dir)
+    else:
+        # 等待主进程创建完成,然后获取路径
+        exp_dir = None
+        sub_dirs = None
 
-    # 保存配置
-    config_path = os.path.join(sub_dirs['logs'], 'config.json')
-    save_config(config_dict, config_path)
+    # 广播文件夹路径到所有进程
+    accelerator.wait_for_everyone()
+    if not accelerator.is_main_process:
+        # 从主进程同步目录信息
+        import time
+        time.sleep(2)  # 等待主进程创建完成
+        # 获取最新的训练文件夹
+        output_dirs = sorted([d for d in os.listdir(args.output_dir) if d.startswith('train_')], reverse=True)
+        if output_dirs:
+            exp_dir = os.path.join(args.output_dir, output_dirs[0])
+            sub_dirs = {
+                'root': exp_dir,
+                'models': os.path.join(exp_dir, 'models'),
+                'logs': os.path.join(exp_dir, 'logs'),
+                'test_results': os.path.join(exp_dir, 'test_results'),
+                'gradcam': os.path.join(exp_dir, 'gradcam'),
+                'plots': os.path.join(exp_dir, 'plots'),
+            }
+
+    accelerator.wait_for_everyone()
+
+    # 只在主进程保存配置
+    if accelerator.is_main_process:
+        config_path = os.path.join(sub_dirs['logs'], 'config.json')
+        save_config(config_dict, config_path)
 
     # ==================== Transform ====================
     transform = transforms.Compose([
@@ -938,16 +1035,19 @@ if __name__ == "__main__":
     ])
 
     # ==================== 加载数据集 ====================
-    print("加载数据集...")
-    full_dataset = PersonSequenceDataset(
-        root_dir=args.root_dir,
-        label_excel=args.label_excel,
-        transform=transform,
-        max_imgs_per_person=args.max_imgs_per_person
-    )
+    accelerator.print("加载数据集...")
+
+    # 使用主进程的随机种子确保所有进程数据划分一致
+    with accelerator.main_process_first():
+        full_dataset = PersonSequenceDataset(
+            root_dir=args.root_dir,
+            label_excel=args.label_excel,
+            transform=transform,
+            max_imgs_per_person=args.max_imgs_per_person
+        )
 
     # ==================== 8:1:1 划分数据集 ====================
-    print(f"\n数据集划分 (Train:Val:Test = {args.train_ratio:.1f}:{args.val_ratio:.1f}:{args.test_ratio:.1f})...")
+    accelerator.print(f"\n数据集划分 (Train:Val:Test = {args.train_ratio:.1f}:{args.val_ratio:.1f}:{args.test_ratio:.1f})...")
 
     indices = list(range(len(full_dataset)))
     random.seed(args.random_seed)
@@ -961,24 +1061,25 @@ if __name__ == "__main__":
     val_idx = indices[n_train:n_train+n_val]
     test_idx = indices[n_train+n_val:]
 
-    print(f"  训练集: {len(train_idx)} 个样本")
-    print(f"  验证集: {len(val_idx)} 个样本")
-    print(f"  测试集: {len(test_idx)} 个样本")
-    print(f"  总计:   {n_total} 个样本\n")
+    accelerator.print(f"  训练集: {len(train_idx)} 个样本")
+    accelerator.print(f"  验证集: {len(val_idx)} 个样本")
+    accelerator.print(f"  测试集: {len(test_idx)} 个样本")
+    accelerator.print(f"  总计:   {n_total} 个样本\n")
 
-    # 保存数据划分信息
-    split_info = {
-        'train_indices': train_idx,
-        'val_indices': val_idx,
-        'test_indices': test_idx,
-        'train_size': len(train_idx),
-        'val_size': len(val_idx),
-        'test_size': len(test_idx)
-    }
-    split_path = os.path.join(sub_dirs['logs'], 'data_split.json')
-    with open(split_path, 'w') as f:
-        json.dump(split_info, f, indent=4)
-    print(f"✓ 数据划分信息已保存: {split_path}\n")
+    # 只在主进程保存数据划分信息
+    if accelerator.is_main_process:
+        split_info = {
+            'train_indices': train_idx,
+            'val_indices': val_idx,
+            'test_indices': test_idx,
+            'train_size': len(train_idx),
+            'val_size': len(val_idx),
+            'test_size': len(test_idx)
+        }
+        split_path = os.path.join(sub_dirs['logs'], 'data_split.json')
+        with open(split_path, 'w') as f:
+            json.dump(split_info, f, indent=4)
+        print(f"✓ 数据划分信息已保存: {split_path}\n")
 
     # 创建子数据集
     train_dataset = torch.utils.data.Subset(full_dataset, train_idx)
@@ -991,7 +1092,7 @@ if __name__ == "__main__":
     effective_batch_size = min(args.batch_size, max(2, len(train_idx) // 2))
 
     if effective_batch_size < args.batch_size:
-        print(f"⚠️  数据集较小,自动调整 batch_size: {args.batch_size} → {effective_batch_size}\n")
+        accelerator.print(f"⚠️  数据集较小,自动调整 batch_size: {args.batch_size} → {effective_batch_size}\n")
 
     train_loader = DataLoader(
         train_dataset,
@@ -999,7 +1100,7 @@ if __name__ == "__main__":
         shuffle=True,
         num_workers=args.num_workers,
         collate_fn=person_sequence_collate_fn,
-        pin_memory=False,
+        pin_memory=True,
         drop_last=True  # 丢弃最后一个不完整的 batch,避免 batch_size=1
     )
     val_loader = DataLoader(
@@ -1008,25 +1109,37 @@ if __name__ == "__main__":
         shuffle=False,
         num_workers=args.num_workers,
         collate_fn=person_sequence_collate_fn,
-        pin_memory=False,
+        pin_memory=True,
         drop_last=False  # 验证集保留所有数据
     )
 
     # 测试集不再使用 DataLoader,改用逐样本推理
     # 这样可以完美处理任意数量的测试样本,包括只有1个样本的情况
-    print("ℹ️  测试集将使用逐样本推理模式 (无 batch_size 限制)\n")
+    accelerator.print("ℹ️  测试集将使用逐样本推理模式 (无 batch_size 限制)\n")
 
     # ==================== 创建模型 ====================
-    print("创建模型...")
-    model = ResNetAttentionFusion(pretrained=True, num_classes=2).to(DEVICE)
-    print(f"✓ 模型已加载到设备: {DEVICE}\n")
+    accelerator.print("创建模型...")
+    model = ResNetAttentionFusion(pretrained=True, num_classes=2)
+
+    # ==================== 准备优化器和调度器 ====================
+    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    # ==================== 使用 Accelerator 准备模型和数据加载器 ====================
+    model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
+        model, optimizer, train_loader, val_loader, scheduler
+    )
+
+    accelerator.print(f"✓ 模型已加载到设备: {accelerator.device}")
+    accelerator.print(f"✓ 使用 {accelerator.num_processes} 个进程进行训练\n")
 
     # ==================== 训练或加载模型 ====================
     if args.load_model:
         # 加载已有模型
-        print(f"加载已有模型: {args.load_model}")
-        model.load_state_dict(torch.load(args.load_model, map_location=DEVICE))
-        print(f"✓ 模型加载成功\n")
+        accelerator.print(f"加载已有模型: {args.load_model}")
+        unwrapped_model = accelerator.unwrap_model(model)
+        unwrapped_model.load_state_dict(torch.load(args.load_model, map_location=DEVICE))
+        accelerator.print(f"✓ 模型加载成功\n")
         best_val_acc = 0.0  # 未知
     elif args.train:
         # 训练模型
@@ -1037,24 +1150,33 @@ if __name__ == "__main__":
             device=DEVICE,
             sub_dirs=sub_dirs,
             epochs=args.epochs,
-            lr=args.learning_rate
+            lr=args.learning_rate,
+            accelerator=accelerator
         )
+        # 等待所有进程完成训练
+        accelerator.wait_for_everyone()
+
         # 训练后加载最佳模型
-        best_model_path = os.path.join(sub_dirs['models'], "best_model.pth")
-        model.load_state_dict(torch.load(best_model_path, map_location=DEVICE))
+        if accelerator.is_main_process:
+            best_model_path = os.path.join(sub_dirs['models'], "best_model.pth")
+            unwrapped_model = accelerator.unwrap_model(model)
+            unwrapped_model.load_state_dict(torch.load(best_model_path, map_location=DEVICE))
     else:
-        print("跳过训练 (使用 --train 启用训练)\n")
+        accelerator.print("跳过训练 (使用 --train 启用训练)\n")
         best_val_acc = 0.0
 
     # ==================== 测试集评估 ====================
-    if args.test and len(test_idx) > 0:
-        print("\n" + "="*60)
-        print("在测试集上评估模型...")
-        print("="*60 + "\n")
+    # 只在主进程进行测试
+    if args.test and len(test_idx) > 0 and accelerator.is_main_process:
+        accelerator.print("\n" + "="*60)
+        accelerator.print("在测试集上评估模型...")
+        accelerator.print("="*60 + "\n")
 
         # 评估 - 直接传入 dataset,不使用 DataLoader
+        # 需要使用解包的模型进行测试
+        unwrapped_model = accelerator.unwrap_model(model)
         test_metrics = evaluate_test_set(
-            model=model,
+            model=unwrapped_model,
             test_dataset=test_dataset,  # 传入 dataset 而非 loader
             device=DEVICE,
             class_names=args.class_names,
@@ -1070,25 +1192,27 @@ if __name__ == "__main__":
             'test_f1': float(test_metrics['f1']),
             'test_auc': float(test_metrics['auc']),
             'training_epochs': args.epochs,
-            'device': args.device
+            'device': str(accelerator.device),
+            'num_processes': accelerator.num_processes
         }
 
         results_path = os.path.join(exp_dir, 'final_results.json')
         with open(results_path, 'w') as f:
             json.dump(final_results, f, indent=4)
 
-        print("\n" + "="*60)
-        print("最终结果摘要")
-        print("="*60)
-        print(f"  最佳验证准确率: {best_val_acc:.4f}")
-        print(f"  测试集准确率:   {test_metrics['accuracy']:.4f}")
-        print(f"  测试集 F1:      {test_metrics['f1']:.4f}")
-        print(f"  测试集 AUC:     {test_metrics['auc']:.4f}")
-        print("="*60)
-        print(f"\n✓ 所有训练材料已保存到: {exp_dir}")
-        print("="*60 + "\n")
+        accelerator.print("\n" + "="*60)
+        accelerator.print("最终结果摘要")
+        accelerator.print("="*60)
+        accelerator.print(f"  最佳验证准确率: {best_val_acc:.4f}")
+        accelerator.print(f"  测试集准确率:   {test_metrics['accuracy']:.4f}")
+        accelerator.print(f"  测试集 F1:      {test_metrics['f1']:.4f}")
+        accelerator.print(f"  测试集 AUC:     {test_metrics['auc']:.4f}")
+        accelerator.print("="*60)
+        accelerator.print(f"\n✓ 所有训练材料已保存到: {exp_dir}")
+        accelerator.print("="*60 + "\n")
     else:
-        print("\n跳过测试评估 (使用 --test 启用测试)\n")
+        if not (args.test and len(test_idx) > 0):
+            accelerator.print("\n跳过测试评估 (使用 --test 启用测试)\n")
 
     # ==================== GradCAM 可视化示例 (可选) ====================
     # 如果想要为某个样本生成 GradCAM
