@@ -10,9 +10,9 @@
 # 训练参数 - 使用更保守的设置防止 NaN
 DATA_ROOT="/home/jinfang/project/CarotidPlaqueStabilityClassifier/data/Carotid_artery"
 LABEL_EXCEL="/home/jinfang/project/CarotidPlaqueStabilityClassifier/data/label.xlsx"
-BATCH_SIZE=4
+BATCH_SIZE=8
 EPOCHS=50
-LR=5e-5  # 降低学习率（从 1e-4 降到 5e-5）
+LR=1e-3  # 降低学习率（从 1e-4 降到 5e-5）
 OUTPUT_DIR="./output"
 
 # 启动多卡训练（使用稳定配置，关闭混合精度）
