@@ -5,11 +5,11 @@
 # ==============================================================================
 
 # 设置使用的 GPU (例如: 0,1 表示使用 GPU 0 和 1)
-export CUDA_VISIBLE_DEVICES=0,1
+# export CUDA_VISIBLE_DEVICES=0,1
 
 # 训练参数 - 使用更保守的设置防止 NaN
-DATA_ROOT="/home/jinfang/project/CarotidPlaqueStabilityClassifier/data"
-LABEL_EXCEL="/home/jinfang/project/CarotidPlaqueStabilityClassifier/label.xlsx"
+DATA_ROOT="/home/jinfang/project/CarotidPlaqueStabilityClassifier/data/Carotid_artery"
+LABEL_EXCEL="/home/jinfang/project/CarotidPlaqueStabilityClassifier/data/label.xlsx"
 BATCH_SIZE=4
 EPOCHS=50
 LR=5e-5  # 降低学习率（从 1e-4 降到 5e-5）
@@ -34,11 +34,11 @@ accelerate launch --config_file accelerate_config_stable.yaml train.py \
     --epochs $EPOCHS \
     --lr $LR \
     --max-imgs-per-person 1000 \
-    --train-ratio 0.5 \
-    --val-ratio 0.3 \
-    --test-ratio 0.2 \
+    --train-ratio 0.8 \
+    --val-ratio 0.1 \
+    --test-ratio 0.1 \
     --output-dir "$OUTPUT_DIR" \
-    --num-workers 4 \
+    --num-workers 0 \
     --seed 42
 
 echo "================================"

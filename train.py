@@ -92,16 +92,28 @@ def person_sequence_collate_fn(batch):
 
 # ====================== 2. 按人组织的数据集 ======================
 class PersonSequenceDataset(Dataset):
-    def __init__(self, root_dir: str, label_excel: str, transform=None, max_imgs_per_person: int = None):
+    def __init__(self, root_dir: str, label_excel: str, transform=None, max_imgs_per_person: int = None,
+                 keep_middle_n: int = 100, min_imgs_required: int = 100):
+        """
+        参数:
+            root_dir: 数据根目录
+            label_excel: 标签 Excel 文件路径
+            transform: 数据增强
+            max_imgs_per_person: 已废弃，保留用于兼容性
+            keep_middle_n: 保留中间的 N 张图片 (掐头去尾)
+            min_imgs_required: 最少需要的图片数量，不足则舍弃该样本
+        """
         self.root_dir = root_dir
         self.transform = transform
-        self.max_imgs = max_imgs_per_person
+        self.keep_middle_n = keep_middle_n
+        self.min_imgs_required = min_imgs_required
         self.persons = self._load_persons(label_excel)
 
     def _load_persons(self, label_excel) -> List[Dict]:
         df = pd.read_excel(label_excel)
         name_to_label = dict(zip(df['name'], df['label']))
         persons = []
+        skipped_persons = []  # 记录被跳过的样本
 
         for person_name in os.listdir(self.root_dir):
             person_dir = os.path.join(self.root_dir, person_name)
@@ -122,22 +134,62 @@ class PersonSequenceDataset(Dataset):
             if not img_paths:
                 continue
 
-            if self.max_imgs and len(img_paths) > self.max_imgs:
-                img_paths = random.sample(img_paths, self.max_imgs)
+            # 对图片路径进行排序，确保顺序一致
+            img_paths = sorted(img_paths)
+
+            # 检查图片数量是否满足最低要求
+            total_imgs = len(img_paths)
+            if total_imgs < self.min_imgs_required:
+                skipped_persons.append({
+                    'name': person_name,
+                    'count': total_imgs,
+                    'label': label
+                })
+                continue
+
+            # 掐头去尾，保留中间的 keep_middle_n 张图片
+            start_idx = (total_imgs - self.keep_middle_n) // 2
+            end_idx = start_idx + self.keep_middle_n
+            img_paths_selected = img_paths[start_idx:end_idx]
 
             persons.append({
                 'name': person_name,
-                'paths': img_paths,
-                'label': label
+                'paths': img_paths_selected,
+                'label': label,
+                'original_count': total_imgs  # 保存原始图片数量
             })
 
-        print(f"Loaded {len(persons)} persons.")
-        total_imgs = sum(len(p['paths']) for p in persons)
-        print(f"Total images: {total_imgs}")
+        # 打印统计信息
         print("="*60)
+        print(f"数据加载统计:")
+        print("="*60)
+        print(f"✓ 成功加载: {len(persons)} 个样本")
+        print(f"✗ 跳过样本: {len(skipped_persons)} 个 (图片数 < {self.min_imgs_required})")
+        print(f"每个样本保留: {self.keep_middle_n} 张图片 (掐头去尾)")
+
+        if skipped_persons:
+            print("\n跳过的样本详情:")
+            for p in sorted(skipped_persons, key=lambda x: x['name']):
+                print(f"  ✗ {p['name']:15s}: {p['count']:4d} 张 (< {self.min_imgs_required}) | Label: {p['label']}")
+
+        print("\n成功加载的样本:")
+        print(f"{'样本名称':15s} {'原始张数':>8s} {'保留张数':>8s} {'标签':>6s}")
+        print("-"*60)
         for p in sorted(persons, key=lambda x: x['name']):
-            print(f"  {p['name']:10s}: {len(p['paths']):4d} 张 | Label: {p['label']}")
-        print("="*60)
+            print(f"{p['name']:15s} {p['original_count']:8d} {len(p['paths']):8d} {p['label']:6d}")
+
+        # 统计每个类别的样本数
+        label_counts = {}
+        for p in persons:
+            label_counts[p['label']] = label_counts.get(p['label'], 0) + 1
+
+        print("-"*60)
+        print(f"总计: {len(persons)} 个样本, {len(persons) * self.keep_middle_n} 张图片")
+        print(f"类别分布: ", end="")
+        for label, count in sorted(label_counts.items()):
+            print(f"Label {label}: {count} 个  ", end="")
+        print("\n" + "="*60)
+
         return persons
 
     def __len__(self):
@@ -520,42 +572,41 @@ def plot_training_curves(history, epochs, save_dir):
     # 创建 2x2 子图
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-    # 1. 损失曲线
+    # 1. 训练集损失
     axes[0, 0].plot(epochs_range, history['train_loss'], 'b-', label='Train Loss', linewidth=2)
-    axes[0, 0].plot(epochs_range, history['val_loss'], 'r-', label='Val Loss', linewidth=2)
     axes[0, 0].set_xlabel('Epoch', fontsize=12)
     axes[0, 0].set_ylabel('Loss', fontsize=12)
-    axes[0, 0].set_title('Training and Validation Loss', fontsize=14, fontweight='bold')
+    axes[0, 0].set_title('Training Loss', fontsize=14, fontweight='bold')
     axes[0, 0].legend(fontsize=10)
     axes[0, 0].grid(alpha=0.3)
 
-    # 2. 准确率曲线
-    axes[0, 1].plot(epochs_range, history['val_acc'], 'g-', linewidth=2)
+    # 2. 验证集损失
+    axes[0, 1].plot(epochs_range, history['val_loss'], 'r-', label='Val Loss', linewidth=2)
     axes[0, 1].set_xlabel('Epoch', fontsize=12)
-    axes[0, 1].set_ylabel('Accuracy', fontsize=12)
-    axes[0, 1].set_title('Validation Accuracy', fontsize=14, fontweight='bold')
+    axes[0, 1].set_ylabel('Loss', fontsize=12)
+    axes[0, 1].set_title('Validation Loss', fontsize=14, fontweight='bold')
+    axes[0, 1].legend(fontsize=10)
     axes[0, 1].grid(alpha=0.3)
+
+    # 3. 验证准确率曲线
+    axes[1, 0].plot(epochs_range, history['val_acc'], 'g-', linewidth=2)
+    axes[1, 0].set_xlabel('Epoch', fontsize=12)
+    axes[1, 0].set_ylabel('Accuracy', fontsize=12)
+    axes[1, 0].set_title('Validation Accuracy', fontsize=14, fontweight='bold')
+    axes[1, 0].grid(alpha=0.3)
     best_acc = max(history['val_acc'])
     best_epoch = history['val_acc'].index(best_acc) + 1
-    axes[0, 1].axhline(y=best_acc, color='r', linestyle='--',
+    axes[1, 0].axhline(y=best_acc, color='r', linestyle='--',
                        label=f'Best: {best_acc:.4f} @ Epoch {best_epoch}')
-    axes[0, 1].legend(fontsize=10)
+    axes[1, 0].legend(fontsize=10)
 
-    # 3. 学习率曲线
-    axes[1, 0].plot(epochs_range, history['learning_rate'], 'purple', linewidth=2)
-    axes[1, 0].set_xlabel('Epoch', fontsize=12)
-    axes[1, 0].set_ylabel('Learning Rate', fontsize=12)
-    axes[1, 0].set_title('Learning Rate Schedule', fontsize=14, fontweight='bold')
-    axes[1, 0].grid(alpha=0.3)
-    axes[1, 0].set_yscale('log')
-
-    # 4. 损失vs准确率
-    axes[1, 1].plot(history['val_loss'], history['val_acc'], 'o-',
-                    color='orange', linewidth=2, markersize=5)
-    axes[1, 1].set_xlabel('Validation Loss', fontsize=12)
-    axes[1, 1].set_ylabel('Validation Accuracy', fontsize=12)
-    axes[1, 1].set_title('Val Loss vs Val Accuracy', fontsize=14, fontweight='bold')
+    # 4. 学习率曲线
+    axes[1, 1].plot(epochs_range, history['learning_rate'], 'purple', linewidth=2)
+    axes[1, 1].set_xlabel('Epoch', fontsize=12)
+    axes[1, 1].set_ylabel('Learning Rate', fontsize=12)
+    axes[1, 1].set_title('Learning Rate Schedule', fontsize=14, fontweight='bold')
     axes[1, 1].grid(alpha=0.3)
+    axes[1, 1].set_yscale('log')
 
     plt.tight_layout()
     save_path = os.path.join(save_dir, 'training_curves.png')
