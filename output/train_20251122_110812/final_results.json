@@ -1,0 +1,11 @@
+{
+    "best_val_acc": 0.6388888888888888,
+    "test_accuracy": 0.45652173913043476,
+    "test_precision": 0.36363636363636365,
+    "test_recall": 0.75,
+    "test_f1": 0.4897959183673469,
+    "test_auc": 0.53125,
+    "training_epochs": 20,
+    "device": "cuda:0",
+    "num_processes": 2
+}

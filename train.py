@@ -93,7 +93,7 @@ def person_sequence_collate_fn(batch):
 # ====================== 2. 按人组织的数据集 ======================
 class PersonSequenceDataset(Dataset):
     def __init__(self, root_dir: str, label_excel: str, transform=None, max_imgs_per_person: int = None,
-                 keep_middle_n: int = 100, min_imgs_required: int = 100):
+                 keep_middle_n: int = 100, min_imgs_required: int = 100, verbose: bool = True):
         """
         参数:
             root_dir: 数据根目录
@@ -102,11 +102,13 @@ class PersonSequenceDataset(Dataset):
             max_imgs_per_person: 已废弃，保留用于兼容性
             keep_middle_n: 保留中间的 N 张图片 (掐头去尾)
             min_imgs_required: 最少需要的图片数量，不足则舍弃该样本
+            verbose: 是否打印数据加载统计信息（多进程训练时只在主进程设为True）
         """
         self.root_dir = root_dir
         self.transform = transform
         self.keep_middle_n = keep_middle_n
         self.min_imgs_required = min_imgs_required
+        self.verbose = verbose
         self.persons = self._load_persons(label_excel)
 
     def _load_persons(self, label_excel) -> List[Dict]:
@@ -120,7 +122,8 @@ class PersonSequenceDataset(Dataset):
             if not os.path.isdir(person_dir):
                 continue
             if person_name not in name_to_label:
-                print(f"Skip {person_name}: not in label.xlsx")
+                if self.verbose:
+                    print(f"Skip {person_name}: not in label.xlsx")
                 continue
             label = int(name_to_label[person_name])
             if label not in {0, 1}:
@@ -160,35 +163,36 @@ class PersonSequenceDataset(Dataset):
             })
 
         # 打印统计信息
-        print("="*60)
-        print(f"数据加载统计:")
-        print("="*60)
-        print(f"✓ 成功加载: {len(persons)} 个样本")
-        print(f"✗ 跳过样本: {len(skipped_persons)} 个 (图片数 < {self.min_imgs_required})")
-        print(f"每个样本保留: {self.keep_middle_n} 张图片 (掐头去尾)")
+        if self.verbose:
+            print("="*60)
+            print(f"数据加载统计:")
+            print("="*60)
+            print(f"✓ 成功加载: {len(persons)} 个样本")
+            print(f"✗ 跳过样本: {len(skipped_persons)} 个 (图片数 < {self.min_imgs_required})")
+            print(f"每个样本保留: {self.keep_middle_n} 张图片 (掐头去尾)")
 
-        if skipped_persons:
-            print("\n跳过的样本详情:")
-            for p in sorted(skipped_persons, key=lambda x: x['name']):
-                print(f"  ✗ {p['name']:15s}: {p['count']:4d} 张 (< {self.min_imgs_required}) | Label: {p['label']}")
+            if skipped_persons:
+                print("\n跳过的样本详情:")
+                for p in sorted(skipped_persons, key=lambda x: x['name']):
+                    print(f"  ✗ {p['name']:15s}: {p['count']:4d} 张 (< {self.min_imgs_required}) | Label: {p['label']}")
 
-        print("\n成功加载的样本:")
-        print(f"{'样本名称':15s} {'原始张数':>8s} {'保留张数':>8s} {'标签':>6s}")
-        print("-"*60)
-        for p in sorted(persons, key=lambda x: x['name']):
-            print(f"{p['name']:15s} {p['original_count']:8d} {len(p['paths']):8d} {p['label']:6d}")
+            print("\n成功加载的样本:")
+            print(f"{'样本名称':15s} {'原始张数':>8s} {'保留张数':>8s} {'标签':>6s}")
+            print("-"*60)
+            for p in sorted(persons, key=lambda x: x['name']):
+                print(f"{p['name']:15s} {p['original_count']:8d} {len(p['paths']):8d} {p['label']:6d}")
 
-        # 统计每个类别的样本数
-        label_counts = {}
-        for p in persons:
-            label_counts[p['label']] = label_counts.get(p['label'], 0) + 1
+            # 统计每个类别的样本数
+            label_counts = {}
+            for p in persons:
+                label_counts[p['label']] = label_counts.get(p['label'], 0) + 1
 
-        print("-"*60)
-        print(f"总计: {len(persons)} 个样本, {len(persons) * self.keep_middle_n} 张图片")
-        print(f"类别分布: ", end="")
-        for label, count in sorted(label_counts.items()):
-            print(f"Label {label}: {count} 个  ", end="")
-        print("\n" + "="*60)
+            print("-"*60)
+            print(f"总计: {len(persons)} 个样本, {len(persons) * self.keep_middle_n} 张图片")
+            print(f"类别分布: ", end="")
+            for label, count in sorted(label_counts.items()):
+                print(f"Label {label}: {count} 个  ", end="")
+            print("\n" + "="*60)
 
         return persons
 
@@ -211,42 +215,118 @@ class PersonSequenceDataset(Dataset):
         return {p['name']: {'count': len(p['paths']), 'label': p['label']} for p in self.persons}
 
 
-# ====================== 3. 模型：ResNet + Attention Fusion ======================
-class ResNetAttentionFusion(nn.Module):
-    def __init__(self, pretrained=True, num_classes=2, dropout=0.5):
+# ====================== 3. 模型：ResNet34 + 序列建模（BiLSTM + Temporal Conv + Attention）======================
+class ResNetSequenceClassifier(nn.Module):
+    def __init__(self, pretrained=True, num_classes=2, dropout=0.5, freeze_early_layers=True):
+        """
+        序列建模版本：考虑帧间关系的颈动脉斑块分类模型
+
+        架构：
+        1. ResNet34: 提取每帧的空间特征 (冻结layer1, layer2)
+        2. BiLSTM: 捕获双向时序依赖关系
+        3. Temporal Conv1D: 提取局部时序模式
+        4. Multi-Head Attention: 学习帧间重要性
+        5. 深度分类器: 融合特征进行分类
+
+        参数:
+            pretrained: 是否使用预训练权重
+            num_classes: 分类数量
+            dropout: Dropout比率
+            freeze_early_layers: 是否冻结早期层
+        """
         super().__init__()
-        resnet = models.resnet18(pretrained=pretrained)
-        '''
-          list(resnet.children())[:-2] 表示取 ResNet18 的所有层,除了最后2层:
 
-        ResNet18 的完整结构:
-        ResNet18.children() = [
-            0: Conv2d(3, 64, kernel_size=7, stride=2, padding=3)     # 初始卷积
-            1: BatchNorm2d(64)
-            2: ReLU(inplace=True)
-            3: MaxPool2d(kernel_size=3, stride=2, padding=1)
-            4: layer1 (残差块组1)
-            5: layer2 (残差块组2)
-            6: layer3 (残差块组3)
-            7: layer4 (残差块组4)  ← 这是最后一个卷积层
-            8: AdaptiveAvgPool2d((1, 1))  ← 被去掉
-            9: Linear(512, 1000)           ← 被去掉
-  ]
-        '''
+        # ============ 1. 空间特征提取器：ResNet34 ============
+        resnet = models.resnet34(pretrained=pretrained)
         self.feature_extractor = nn.Sequential(*list(resnet.children())[:-2])  # [*, 512, 7, 7]
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))  # [*, 512]
 
-        self.attention = nn.Sequential(
-            nn.Linear(512, 128),
+        # 冻结早期层
+        if freeze_early_layers:
+            for param in resnet.layer1.parameters():
+                param.requires_grad = False
+            for param in resnet.layer2.parameters():
+                param.requires_grad = False
+            print("✓ 冻结 ResNet34 的 layer1 和 layer2")
+
+        # ============ 2. 序列建模：BiLSTM ============
+        self.lstm_hidden_size = 256
+        self.bilstm = nn.LSTM(
+            input_size=512,
+            hidden_size=self.lstm_hidden_size,
+            num_layers=2,               # 2层LSTM
+            batch_first=True,           # 输入格式: [batch, seq_len, feature]
+            bidirectional=True,         # 双向LSTM
+            dropout=dropout * 0.6       # LSTM层间dropout
+        )
+        # BiLSTM输出: 512维 (256 forward + 256 backward)
+
+        # ============ 3. 时序卷积：捕获局部时序模式 ============
+        # 使用1D卷积在时间维度上提取特征
+        self.temporal_conv = nn.Sequential(
+            # 卷积核大小3: 捕获连续3帧的模式
+            nn.Conv1d(512, 256, kernel_size=3, padding=1),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(dropout * 0.3),
+
+            # 卷积核大小5: 捕获连续5帧的模式
+            nn.Conv1d(256, 128, kernel_size=5, padding=2),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+        )
+
+        # ============ 4. Multi-Head Self-Attention ============
+        self.num_heads = 8
+        self.multihead_attn = nn.MultiheadAttention(
+            embed_dim=512,              # BiLSTM的输出维度
+            num_heads=self.num_heads,
+            dropout=dropout * 0.3,
+            batch_first=True
+        )
+
+        # ============ 5. 时序注意力（学习每帧的重要性）============
+        self.temporal_attention = nn.Sequential(
+            nn.Linear(512, 256),
             nn.Tanh(),
-            nn.Linear(128, 1)
-        )
-        self.classifier = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(512, num_classes)
+            nn.Dropout(dropout * 0.3),
+            nn.Linear(256, 1)
         )
 
-        # Grad-CAM
+        # ============ 6. 特征融合层 ============
+        # 融合BiLSTM特征(512) + 时序卷积特征(128)
+        self.fusion = nn.Sequential(
+            nn.Linear(512 + 128, 512),
+            nn.ReLU(),
+            nn.BatchNorm1d(512),
+            nn.Dropout(dropout * 0.5)
+        )
+
+        # ============ 7. 深度分类器 ============
+        self.classifier = nn.Sequential(
+            # 第1层
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.BatchNorm1d(512),
+            nn.Dropout(dropout),
+
+            # 第2层
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.BatchNorm1d(256),
+            nn.Dropout(dropout * 0.7),
+
+            # 第3层
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.BatchNorm1d(128),
+            nn.Dropout(dropout * 0.5),
+
+            # 输出层
+            nn.Linear(128, num_classes)
+        )
+
+        # ============ Grad-CAM 钩子 ============
         self.feature_maps = None
         self.gradients = None
         resnet.layer4[-1].register_forward_hook(self._save_feature_maps)
@@ -254,75 +334,101 @@ class ResNetAttentionFusion(nn.Module):
 
     def _save_feature_maps(self, module, input, output):
         self.feature_maps = output
-        '''
-        feature_maps 内容:
-        - 形状: [1, 512, 7, 7]
-        - 512 个通道,每个通道是 7×7 的特征图
-        '''
 
     def _save_gradients(self, module, grad_in, grad_out):
         self.gradients = grad_out[0]
-        '''
-        gradients 内容:
-        - 形状: [1, 512, 7, 7]
-        - 表示每个特征图的每个位置对预测结果的影响
-        - 梯度越大,说明该位置对预测越重要
-        '''
 
     def forward(self, x):
         """
-        x: List[Tensor] 每个: [N_i, 3, 224, 224]
-           或单个 Tensor: [N, 3, 224, 224]
+        序列建模的前向传播
+
+        输入:
+            x: List[Tensor], 每个Tensor形状为 [N_i, 3, 224, 224]
+               N_i是第i个样本的序列长度（可能不同）
+
+        输出:
+            logits: [Batch, num_classes] 分类logits
+            fused: [Batch, 512] 融合后的特征（用于可视化等）
         """
         if not isinstance(x, list):
             x = [x]
 
-        # 提取所有特征 - 使用批量处理避免 BatchNorm 问题
-        all_feats = []
-        batch_sizes = []
-
-        # 将所有序列合并成一个大 batch 处理
+        # ============ 步骤1: 批量提取空间特征 ============
+        # 将所有序列合并成一个大batch处理（避免BatchNorm问题）
         concat_imgs = torch.cat(x, dim=0)  # [sum(N_i), 3, 224, 224]
-        # print(f"Concat imgs shape: {concat_imgs.shape}")# torch.Size([1271, 3, 224, 224])
 
-        # 确保输入是连续的且格式正确
         if not concat_imgs.is_contiguous():
             concat_imgs = concat_imgs.contiguous()
 
-        # 统一批量提取特征
-        with torch.cuda.amp.autocast(enabled=False):  # 禁用混合精度避免 cuDNN 问题
+        # 提取CNN特征
+        with torch.cuda.amp.autocast(enabled=False):
             concat_feats = self.feature_extractor(concat_imgs)  # [sum(N_i), 512, 7, 7]
-            # AdaptiveAvgPool2d((1, 1)),对每个 7×7 的特征图求平均 → 1×1 → [sum(N_i), 512, 1, 1]   
             concat_pooled = self.avgpool(concat_feats).view(concat_imgs.size(0), -1)  # [sum(N_i), 512]
 
-        # 按原始序列拆分
+        # ============ 步骤2: 拆分回各个序列 ============
+        sequence_features = []
         start_idx = 0
         for seq in x:
-            B = seq.size(0)
-            batch_sizes.append(B)
-            pooled = concat_pooled[start_idx:start_idx+B]  # [N_i, 512]
-            all_feats.append(pooled)
-            start_idx += B
+            seq_len = seq.size(0)  # 当前序列长度
+            seq_feats = concat_pooled[start_idx:start_idx+seq_len]  # [seq_len, 512]
+            sequence_features.append(seq_feats)
+            start_idx += seq_len
 
-        # Attention 融合  针对每个人都可以有不同数量的图片进行操作
-        fused_list = []
-        for feats in all_feats:  # feats: [N_i, 512]
-            if feats.size(0) == 1:
-                fused = feats.squeeze(0)
+        # ============ 步骤3: 序列建模 ============
+        lstm_outputs = []
+        temporal_conv_outputs = []
+
+        for seq_feats in sequence_features:  # seq_feats: [seq_len, 512]
+            seq_len = seq_feats.size(0)
+
+            if seq_len == 1:
+                # 单帧情况：跳过LSTM和时序卷积
+                lstm_out = seq_feats  # [1, 512]
+                temp_conv_out = torch.zeros(1, 128, device=seq_feats.device)  # [1, 128]
             else:
-                attn = self.attention(feats).squeeze(-1)      #[N_i, 512]-[N_i,1]- [N_i]
-                # 添加数值稳定性：裁剪 attention 分数防止极端值
-                attn = torch.clamp(attn, min=-10, max=10)
-                # print(f"{attn.shape}")#torch.Size([N_i])
-                weights = torch.softmax(attn, dim=0).unsqueeze(-1)
-                # print(f"{weights.shape}")#torch.Size([N_i],1)
-                fused = torch.sum(feats * weights, dim=0)      #[5, 512]* [5, 1]= [5, 512]--》sum= [512]
-                # print(f"{fused.shape}")#torch.Size(512)
+                # -------- BiLSTM --------
+                seq_feats_unsq = seq_feats.unsqueeze(0)  # [1, seq_len, 512]
+                lstm_out, _ = self.bilstm(seq_feats_unsq)  # [1, seq_len, 512]
+                lstm_out = lstm_out.squeeze(0)  # [seq_len, 512]
 
-            fused_list.append(fused)
+                # -------- Multi-Head Self-Attention --------
+                # 学习序列中不同帧之间的关系
+                attn_out, _ = self.multihead_attn(
+                    lstm_out.unsqueeze(0),  # query: [1, seq_len, 512]
+                    lstm_out.unsqueeze(0),  # key: [1, seq_len, 512]
+                    lstm_out.unsqueeze(0)   # value: [1, seq_len, 512]
+                )  # output: [1, seq_len, 512]
+                attn_out = attn_out.squeeze(0)  # [seq_len, 512]
 
-        fused = torch.stack(fused_list)  # [B, 512]
-        logits = self.classifier(fused)  # [B, 2]
+                # 残差连接
+                lstm_out = lstm_out + attn_out  # [seq_len, 512]
+
+                # -------- Temporal Attention（加权融合序列）--------
+                attn_scores = self.temporal_attention(lstm_out).squeeze(-1)  # [seq_len]
+                attn_scores = torch.clamp(attn_scores, min=-10, max=10)  # 数值稳定性
+                attn_weights = torch.softmax(attn_scores, dim=0).unsqueeze(-1)  # [seq_len, 1]
+                lstm_out = torch.sum(lstm_out * attn_weights, dim=0, keepdim=True)  # [1, 512]
+
+                # -------- Temporal Convolution --------
+                # 提取局部时序模式（连续帧的变化）
+                seq_feats_t = seq_feats.t().unsqueeze(0)  # [1, 512, seq_len]
+                temp_conv_out = self.temporal_conv(seq_feats_t)  # [1, 128, seq_len]
+                temp_conv_out = torch.mean(temp_conv_out, dim=2)  # [1, 128] 时序平均池化
+
+            lstm_outputs.append(lstm_out.squeeze(0) if lstm_out.dim() > 1 else lstm_out)
+            temporal_conv_outputs.append(temp_conv_out.squeeze(0) if temp_conv_out.dim() > 1 else temp_conv_out)
+
+        # ============ 步骤4: 堆叠batch ============
+        lstm_features = torch.stack(lstm_outputs)  # [Batch, 512]
+        temporal_features = torch.stack(temporal_conv_outputs)  # [Batch, 128]
+
+        # ============ 步骤5: 特征融合 ============
+        fused = torch.cat([lstm_features, temporal_features], dim=1)  # [Batch, 640]
+        fused = self.fusion(fused)  # [Batch, 512]
+
+        # ============ 步骤6: 分类 ============
+        logits = self.classifier(fused)  # [Batch, num_classes]
+
         return logits, fused
 
     def get_cam(self, img_tensor):
@@ -357,7 +463,7 @@ class ResNetAttentionFusion(nn.Module):
 
 
 # ====================== 4. 训练函数 ======================
-def train_model(model, train_loader, val_loader, device, sub_dirs, epochs=20, lr=1e-4, accelerator=None):
+def train_model(model, train_loader, val_loader, device, sub_dirs, epochs=20, lr=1e-4, weight_decay=1e-5, patience=10, accelerator=None):
     """
     训练模型并保存训练历史
 
@@ -369,10 +475,12 @@ def train_model(model, train_loader, val_loader, device, sub_dirs, epochs=20, lr
         sub_dirs: 训练目录字典
         epochs: 训练轮数
         lr: 学习率
+        weight_decay: 权重衰减系数
+        patience: 早停耐心值（验证集无提升的最大epoch数）
         accelerator: Accelerator 对象用于分布式训练
     """
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     # 记录训练历史
@@ -385,6 +493,7 @@ def train_model(model, train_loader, val_loader, device, sub_dirs, epochs=20, lr
 
     best_acc = 0.0
     best_epoch = 0
+    patience_counter = 0  # 早停计数器
 
     # 使用 accelerator.print() 确保只在主进程打印
     if accelerator:
@@ -505,10 +614,11 @@ def train_model(model, train_loader, val_loader, device, sub_dirs, epochs=20, lr
                 f"Val Acc: {val_acc:.4f} | "
                 f"LR: {current_lr:.6f}")
 
-        # ---------------- 保存最佳模型 & 调度器 ----------------
+        # ---------------- 保存最佳模型 & 早停检查 ----------------
         if val_acc > best_acc:
             best_acc = val_acc
             best_epoch = epoch + 1
+            patience_counter = 0  # 重置早停计数器
 
             # 使用 accelerator.save() 保存模型
             if accelerator is None or accelerator.is_main_process:
@@ -519,6 +629,17 @@ def train_model(model, train_loader, val_loader, device, sub_dirs, epochs=20, lr
                 else:
                     torch.save(model.state_dict(), os.path.join(sub_dirs['models'], "best_model.pth"))
                 print(f"  → 保存最佳模型 (Val Acc: {best_acc:.4f})")
+        else:
+            patience_counter += 1
+            if accelerator is None or accelerator.is_main_process:
+                print(f"  ⚠️  验证准确率未提升 ({patience_counter}/{patience})")
+
+            # 早停检查
+            if patience_counter >= patience:
+                if accelerator is None or accelerator.is_main_process:
+                    print(f"\n⛔ 早停！连续 {patience} 个epoch验证准确率未提升")
+                    print(f"最佳验证准确率: {best_acc:.4f} (Epoch {best_epoch})")
+                break
 
         scheduler.step()
 
@@ -532,8 +653,9 @@ def train_model(model, train_loader, val_loader, device, sub_dirs, epochs=20, lr
     # 只在主进程保存
     if accelerator is None or accelerator.is_main_process:
         # 1. 保存为 CSV
+        actual_epochs = len(history['train_loss'])  # 实际训练的epoch数（可能因早停而少于设定值）
         history_df = pd.DataFrame(history)
-        history_df['epoch'] = range(1, epochs + 1)
+        history_df['epoch'] = range(1, actual_epochs + 1)
         history_csv_path = os.path.join(sub_dirs['logs'], 'training_history.csv')
         history_df.to_csv(history_csv_path, index=False)
         print(f"✓ 训练历史已保存: {history_csv_path}")
@@ -544,7 +666,7 @@ def train_model(model, train_loader, val_loader, device, sub_dirs, epochs=20, lr
             json.dump(history, f, indent=4)
 
         # 3. 绘制训练曲线
-        plot_training_curves(history, epochs, sub_dirs['plots'])
+        plot_training_curves(history, actual_epochs, sub_dirs['plots'])
 
         # 4. 保存最终模型
         final_model_path = os.path.join(sub_dirs['models'], "final_model.pth")
@@ -617,7 +739,7 @@ def plot_training_curves(history, epochs, save_dir):
 
 
 # ====================== 5. 推理 + Grad-CAM ======================
-def predict_and_visualize(model, dataset, person_name, device, max_vis=3):
+def predict_and_visualize(model, dataset, person_name, device, transform, max_vis=3):
     model.eval()
     person = next((p for p in dataset.persons if p['name'] == person_name), None)
     if not person:
@@ -980,7 +1102,7 @@ def parse_args():
                             help='训练轮数')
     train_group.add_argument('--lr', '--learning-rate', type=float, default=1e-4,
                             dest='learning_rate', help='学习率')
-    train_group.add_argument('--weight-decay', type=float, default=1e-5,
+    train_group.add_argument('--weight-decay', type=float, default=1e-4,
                             help='权重衰减系数')
 
     # 数据划分
@@ -1092,7 +1214,35 @@ if __name__ == "__main__":
         save_config(config_dict, config_path)
 
     # ==================== Transform ====================
-    transform = transforms.Compose([
+    # 训练集 Transform - 针对医学超声图像的保守增强
+    train_transform = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.RandomCrop((224, 224)),          # 随机裁剪（模拟位置偏差）
+        transforms.RandomHorizontalFlip(p=0.5),     # 水平翻转（左右颈动脉对称）
+        transforms.RandomRotation(degrees=10),      # 轻微旋转±10度（保守，避免破坏结构）
+        transforms.RandomAffine(                    # 轻微仿射变换
+            degrees=0,
+            translate=(0.05, 0.05),  # 平移±5%（更保守）
+            scale=(0.95, 1.05)       # 缩放95%-105%（更保守）
+        ),
+        # 医学图像特有增强 - 非常轻微的颜色调整
+        transforms.ColorJitter(
+            brightness=0.1,    # 亮度±10%（模拟超声探头压力差异）
+            contrast=0.1,      # 对比度±10%（模拟设备设置差异）
+            saturation=0.0,    # 不调整饱和度（超声图像通常是灰度）
+            hue=0.0           # 不调整色调
+        ),
+        # 可选：添加轻微高斯模糊（模拟图像质量差异）
+        transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 0.5)),
+        transforms.ToTensor(),
+        # 随机添加轻微噪声（在ToTensor之后，通过Lambda实现）
+        transforms.Lambda(lambda x: x + torch.randn_like(x) * 0.02 if torch.rand(1) > 0.5 else x),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                           std=[0.229, 0.224, 0.225])
+    ])
+
+    # 验证集/测试集 Transform - 仅基础处理
+    val_transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
@@ -1104,17 +1254,20 @@ if __name__ == "__main__":
 
     # 使用主进程的随机种子确保所有进程数据划分一致
     with accelerator.main_process_first():
-        full_dataset = PersonSequenceDataset(
+        # 先创建临时数据集获取所有样本信息（用于划分）
+        temp_dataset = PersonSequenceDataset(
             root_dir=args.root_dir,
             label_excel=args.label_excel,
-            transform=transform,
-            max_imgs_per_person=args.max_imgs_per_person
+            transform=val_transform,  # 临时使用val_transform
+            max_imgs_per_person=args.max_imgs_per_person,
+            verbose=accelerator.is_main_process  # 只在主进程打印统计信息
         )
+        all_persons = temp_dataset.persons  # 获取所有person信息
 
-    # ==================== 8:1:1 划分数据集 ====================
+    # ==================== 划分数据集 ====================
     accelerator.print(f"\n数据集划分 (Train:Val:Test = {args.train_ratio:.1f}:{args.val_ratio:.1f}:{args.test_ratio:.1f})...")
 
-    indices = list(range(len(full_dataset)))
+    indices = list(range(len(all_persons)))
     random.seed(args.random_seed)
     random.shuffle(indices)
 
@@ -1131,6 +1284,48 @@ if __name__ == "__main__":
     accelerator.print(f"  测试集: {len(test_idx)} 个样本")
     accelerator.print(f"  总计:   {n_total} 个样本\n")
 
+    # 根据索引划分persons列表
+    train_persons = [all_persons[i] for i in train_idx]
+    val_persons = [all_persons[i] for i in val_idx]
+    test_persons = [all_persons[i] for i in test_idx]
+
+    # 创建三个独立的数据集，使用不同的transform
+    with accelerator.main_process_first():
+        # 训练集 - 使用强数据增强
+        train_dataset = PersonSequenceDataset(
+            root_dir=args.root_dir,
+            label_excel=args.label_excel,
+            transform=train_transform,
+            max_imgs_per_person=args.max_imgs_per_person,
+            verbose=False  # 不打印统计信息（persons会被替换）
+        )
+        train_dataset.persons = train_persons  # 替换为训练集的persons
+
+        # 验证集 - 使用基础transform
+        val_dataset = PersonSequenceDataset(
+            root_dir=args.root_dir,
+            label_excel=args.label_excel,
+            transform=val_transform,
+            max_imgs_per_person=args.max_imgs_per_person,
+            verbose=False  # 不打印统计信息（persons会被替换）
+        )
+        val_dataset.persons = val_persons  # 替换为验证集的persons
+
+        # 测试集 - 使用基础transform
+        test_dataset = PersonSequenceDataset(
+            root_dir=args.root_dir,
+            label_excel=args.label_excel,
+            transform=val_transform,
+            max_imgs_per_person=args.max_imgs_per_person,
+            verbose=False  # 不打印统计信息（persons会被替换）
+        )
+        test_dataset.persons = test_persons  # 替换为测试集的persons
+
+    accelerator.print(f"✓ 数据集创建完成:")
+    accelerator.print(f"  训练集: {len(train_dataset)} 个样本 (使用数据增强)")
+    accelerator.print(f"  验证集: {len(val_dataset)} 个样本")
+    accelerator.print(f"  测试集: {len(test_dataset)} 个样本\n")
+
     # 只在主进程保存数据划分信息
     if accelerator.is_main_process:
         split_info = {
@@ -1146,15 +1341,10 @@ if __name__ == "__main__":
             json.dump(split_info, f, indent=4)
         print(f"✓ 数据划分信息已保存: {split_path}\n")
 
-    # 创建子数据集
-    train_dataset = torch.utils.data.Subset(full_dataset, train_idx)
-    val_dataset = torch.utils.data.Subset(full_dataset, val_idx)
-    test_dataset = torch.utils.data.Subset(full_dataset, test_idx)
-
     # ==================== DataLoader ====================
     # 注意: batch_size 不能为 1,否则 BatchNorm 会报错
     # 如果数据集太小,自动调整 batch_size
-    effective_batch_size = min(args.batch_size, max(2, len(train_idx) // 2))
+    effective_batch_size = min(args.batch_size, max(2, len(train_dataset) // 2))
 
     if effective_batch_size < args.batch_size:
         accelerator.print(f"⚠️  数据集较小,自动调整 batch_size: {args.batch_size} → {effective_batch_size}\n")
@@ -1166,7 +1356,7 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         collate_fn=person_sequence_collate_fn,
         pin_memory=True,
-        drop_last=True  # 丢弃最后一个不完整的 batch,避免 batch_size=1
+        drop_last=False  # 丢弃最后一个不完整的 batch,避免 batch_size=1
     )
     val_loader = DataLoader(
         val_dataset,
@@ -1184,10 +1374,16 @@ if __name__ == "__main__":
 
     # ==================== 创建模型 ====================
     accelerator.print("创建模型...")
-    model = ResNetAttentionFusion(pretrained=True, num_classes=2)
+    accelerator.print("使用 ResNet34 + 序列建模（BiLSTM + Temporal Conv + Multi-Head Attention）")
+    model = ResNetSequenceClassifier(
+        pretrained=True,
+        num_classes=2,
+        dropout=0.5,              # Dropout比率
+        freeze_early_layers=True  # 冻结layer1和layer2
+    )
 
     # ==================== 准备优化器和调度器 ====================
-    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
+    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     # ==================== 使用 Accelerator 准备模型和数据加载器 ====================
@@ -1216,6 +1412,8 @@ if __name__ == "__main__":
             sub_dirs=sub_dirs,
             epochs=args.epochs,
             lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+            patience=100,  # 早停耐心值
             accelerator=accelerator
         )
         # 等待所有进程完成训练
