@@ -12,7 +12,7 @@ DATA_ROOT="/home/jinfang/project/CarotidPlaqueStabilityClassifier/data/Carotid_a
 LABEL_EXCEL="/home/jinfang/project/CarotidPlaqueStabilityClassifier/data/label.xlsx"
 BATCH_SIZE=8
 EPOCHS=50
-LR=1e-3  # 降低学习率（从 1e-4 降到 5e-5）
+LR=1e-4  # 降低学习率（从 1e-4 降到 5e-5）
 OUTPUT_DIR="./output"
 
 # 启动多卡训练（使用稳定配置，关闭混合精度）
@@ -34,9 +34,9 @@ accelerate launch --config_file accelerate_config_stable.yaml train.py \
     --epochs $EPOCHS \
     --lr $LR \
     --max-imgs-per-person 1000 \
-    --train-ratio 0.8 \
-    --val-ratio 0.1 \
-    --test-ratio 0.1 \
+    --train-ratio 0.5 \
+    --val-ratio 0.3 \
+    --test-ratio 0.2 \
     --output-dir "$OUTPUT_DIR" \
     --num-workers 0 \
     --seed 42
